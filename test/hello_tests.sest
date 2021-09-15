@@ -1,0 +1,13 @@
+import Hello
+
+module HelloTests = #[test] struct
+
+  #[test]
+  val hello_test() =
+    Testing.it("hello test", fun() ->
+      assert Testing.equal(
+        -expect "Hello, world!",
+        -got  Hello.my_hello())
+    end)
+
+end

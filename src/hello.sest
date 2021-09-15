@@ -1,0 +1,6 @@
+module Hello = struct
+
+  val my_hello() =
+    "Hello, world!"
+
+end
