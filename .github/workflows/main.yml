@@ -28,11 +28,6 @@ jobs:
           erlang/Install -minimal  `pwd`/erlang
           rm erlang.tar.gz
 
-      - name: Install rebar3
-        run: |
-          curl -Lo bin/rebar3 https://s3.amazonaws.com/rebar3/rebar3
-          chmod +x bin/rebar3
-
       - name: Get sesterl
         uses: dawidd6/action-download-artifact@v2
         with:
@@ -43,9 +38,11 @@ jobs:
           path: bin
           repo: gfngfn/Sesterl
 
-      - name: Make sesterl executable
+      - name: Install rebar3 and sesterl
         run: |
-          chmod +x bin/sesterl
+          echo "`pwd`/bin" >> $GITHUB_PATH
+          curl -Lo bin/rebar3 https://s3.amazonaws.com/rebar3/rebar3
+          chmod +x bin/rebar3
 
       - name: Run tests
         run: rebar3 sesterl test
