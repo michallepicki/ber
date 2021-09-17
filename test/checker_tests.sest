@@ -1,0 +1,15 @@
+import Checker
+
+module CheckerTests = #[test] struct
+
+  #[test]
+  val peel_test() =
+    let ctx = Checker.NVariable("b") :: Checker.NVariable("a") :: Checker.NExistential("c") :: [] in
+    let expect = [Checker.NExistential("c")] in
+    Testing.it("peel test", fun() ->
+      assert Testing.equal(
+        -expect expect,
+        -got  Checker.peel(ctx, Checker.NVariable("a")))
+    end)
+
+end

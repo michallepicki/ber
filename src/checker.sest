@@ -1,0 +1,394 @@
+module Checker = struct
+  
+  val trace() = true
+
+  type typ =
+    | TUnset
+    | TUnit
+    | TVariable(binary)
+    | TExistential(binary)
+    | TQuantification(binary, typ)
+    | TFunction(typ, typ)
+
+  type expr =
+    | XVariable(binary, typ)
+    | XUnit
+    | XAbstraction(binary, typ, expr)
+    | XApplication(expr, expr, typ)
+    | XAnnotation(expr, typ)
+    | XLet(binary, expr, expr)
+
+  val rec expression_type(expression : expr) : typ =
+    case expression of
+      | XUnit -> TUnit
+      | XVariable(_, typ) -> typ
+      | XAbstraction(_, atyp, body) -> TFunction(atyp, expression_type(body))
+      | XApplication(_, _, typ) -> typ
+      | XAnnotation(_, typ) -> typ
+      | XLet(_, _, body) -> expression_type(body)
+    end
+
+  type note =
+    | NVariable(binary)
+    | NExistential(binary)
+    | NSolved(binary, typ)
+    | NMarker(binary)
+    | NTypedVariable(binary, typ)
+
+  val failwith<$a> : fun(list<char>) -> $a = external 1 ```
+    failwith(Message) -> erlang:error(Message).
+  ```
+
+  val one_note(context, w, v, p) =
+    case Stdlib.List.foldl(p, [], context) of
+      | []   -> None
+      | [at] -> Some(at)
+      | ats  -> failwith(format(f'Multiple ~s for ~s: ~p', {w, v, ats}))
+    end
+  
+  val assump(context, v) =
+    one_note(context, "assumptions", v, fun(acc, note) ->
+        let x = case note of
+            | NTypedVariable(av, at) -> if Stdlib.Binary.equal(av, v) then [at] else []
+            | _ -> []
+          end in
+        Stdlib.List.append(x, acc)
+      end)
+  
+  val solution(context, ev) =
+    one_note(context, "solutions", ev, fun(acc, note) ->
+        let x = case note of
+            | NSolved(sv, st) -> if Stdlib.Binary.equal(sv, ev) then [st] else []
+            | _ -> []
+          end in
+        Stdlib.List.append(x, acc)
+      end)
+  
+  val equal<$a> : fun($a, $a) -> bool = external 2 ```
+    equal(A, B) -> A == B.
+  ```
+
+  val rec peel(context, note) =
+    case context of
+      | [] -> []
+      | h :: t -> if equal(h, note) then t else peel(t, note)
+    end
+  
+  val rec splitacc(context, left, right, note) =
+    case right of
+      | [] -> failwith(format(f'Cant split ~p on ~p', {context, note}))
+      | h :: t -> if equal(h, note) then {Stdlib.List.reverse(left), t} else splitacc(context, (h :: left), t, note)
+    end
+
+  val split(context, note) =
+    splitacc(context, [], context, note)
+  
+  val rec contains_free(typ, ev) =
+    case typ of
+      | TExistential(v) -> equal(v, ev)
+      | TQuantification(_, typ) -> contains_free(typ, ev)
+      | TFunction(arg, res) -> if contains_free(arg, ev) then true else contains_free(res, ev)
+      | _ -> false
+    end
+
+  val rec is_mono(typ) =
+    case typ of
+      | TQuantification(_, _) -> false
+      | TFunction(arg, res) -> if is_mono(arg) then is_mono(res) else false
+      | _ -> true
+    end
+  
+  val is_some<$a>(o : option<$a>) : bool =
+    case o of
+      | Some(_) -> true
+      | None -> false
+    end
+
+  val list_contains(x, l) =
+    Stdlib.List.any(fun(i) -> equal(i, x) end, l)
+  
+  val rec check_malformed(context, typ) =
+    case typ of
+      | TUnset -> None
+      | TUnit -> None
+      | TVariable(uv) -> if list_contains(NVariable(uv), context) then None
+                      else Some(format(f'Unbound type variable ~s', {uv}))
+      | TExistential(ev) -> if list_contains(NExistential(ev), context) then None
+                      else if is_some(solution(context, ev)) then None else Some(format(f'Unbound existential variable ~s', {ev}))
+      | TQuantification(uv, typ)    -> check_malformed(NVariable(uv) :: context, typ)
+      | TFunction(arg, res) ->
+          let arg_check = check_malformed(context, res) in
+          if is_some(arg_check) then arg_check else check_malformed(context, arg)
+    end
+
+  val is_well_formed(context, typ) = if is_some(check_malformed(context, typ)) then false else true
+
+  val rec apply(context, t) =
+    case t of
+      | TExistential(ev) -> 
+          case solution(context, ev) of
+            | Some(s) -> apply(context, s)
+            | None -> t
+          end
+      | TFunction(a, b)    -> TFunction(apply(context, a), apply(context, b))
+      | TQuantification(uv, typ)   -> TQuantification(uv, apply(context, typ))
+      | typ             -> typ
+    end
+  
+  val rec apply_expression(context, e) =
+    case e of
+      | XVariable(v, typ) -> XVariable(v, apply(context, typ))
+      | XAbstraction(x, atyp, body) -> XAbstraction(x, apply(context, atyp), apply_expression(context, body))
+      | XApplication(fn, arg, typ) -> XApplication(apply_expression(context, fn), apply_expression(context, arg), apply(context, typ))
+      | XAnnotation(expression, typ) -> XAnnotation(apply_expression(context, expression), apply(context, typ))
+      | XLet(x, expression, body) -> XLet(x, apply_expression(context, expression), apply_expression(context, body))
+      | expression -> expression
+    end
+  
+  val rec subst(thist, thatt, arg) =
+    case arg of
+      | TVariable(_)      -> if equal(thatt, arg) then thist else arg
+      | TFunction(a, b)  -> TFunction(subst(thist, thatt, a), subst(thist, thatt, b))
+      | TQuantification(uv, typ) -> TQuantification(uv, subst(thist, thatt, typ))
+      | typ           -> typ
+    end
+
+  type counter_ref =
+    | CounterRef
+
+  val init_next_id : fun() -> counter_ref = external 0 ```
+    init_next_id() -> counters:new(1, []).
+  ```
+
+  val get_counter_value : fun(counter_ref) -> int = external 1 ```
+    get_counter_value(CounterRef) -> counters:get(CounterRef, 1).
+  ```
+
+  val inc_counter_value : fun(counter_ref) -> unit = external 1 ```
+    inc_counter_value(CounterRef) -> counters:add(CounterRef, 1, 1).
+  ```
+
+  val fresh_e_var(name : binary, next_id_ref : counter_ref) : binary =
+    let next_id = Stdlib.Binary.from_list(format(f'~s~p', {name, get_counter_value(next_id_ref)})) in
+    let _ = inc_counter_value(next_id_ref) in
+    let _ = print_debug(format(f'~s~p~n', {name, next_id})) in
+    next_id
+
+  val rec instantiate_l(context, e_a, a, next_id_ref) =
+    let ne_a = NExistential(e_a) in
+    let inst_l_fail = fun() -> failwith(format(f'Failed to instantiate ~p to ~p', {e_a, a})) end in
+    if if is_mono(a) then is_well_formed(peel(context, ne_a), a) else false then
+      let {post_context, pre_context} = split(context, ne_a) in
+      let _ = if trace() then print_debug(format(f'- InstLSolve ~p :=< ~p', {e_a, a})) else {} in
+      Stdlib.List.append(post_context, (NSolved(e_a, a) :: pre_context))
+    else
+      case a of
+        | TExistential(e_c) ->
+          if list_contains(ne_a, peel(context, NExistential(e_c))) then
+            let {post_context, pre_context} = split(context, NExistential(e_c)) in
+            let _ = if trace() then print_debug(format(f'- InstLReach ~p :=< ~p', {e_a, e_c})) else {} in
+            Stdlib.List.append(post_context, (NSolved(e_c, TExistential(e_a)) :: pre_context))
+          else
+            inst_l_fail()
+        | TFunction(a1, a2) ->
+          if list_contains(ne_a, context) then
+            let {post_context, pre_context} = split(context, ne_a) in
+            let e_a1 = fresh_e_var("a₁", next_id_ref) in
+            let e_a2 = fresh_e_var("a₂", next_id_ref) in
+            let ne_a1 = NExistential(e_a1) in
+            let te_a1 = TExistential(e_a1) in
+            let ne_a2 = NExistential(e_a2) in
+            let te_a2 = TExistential(e_a2) in
+            let a1context = Stdlib.List.append(post_context, (NSolved(e_a, TFunction(te_a1, te_a2)) :: ne_a1 :: ne_a2 :: pre_context)) in
+            let _ = if trace() then print_debug(format(f'- InstLArr(1) ~p :=< ~p in ~p', {a1, e_a1, a1context})) else {} in
+            let theta = instantiate_r(a1context, a1, e_a1, next_id_ref) in
+            let _ = if trace() then print_debug(format(f'- InstRArr(2) ~p :=< ~p in ~p', {e_a2, apply(theta, a2), theta})) else {} in
+            instantiate_l(theta, e_a2, apply(theta, a2), next_id_ref)
+          else
+            inst_l_fail()
+        | TQuantification(u_b, b) ->
+          if list_contains(ne_a, context) then
+            let nu_b = NVariable(u_b) in
+            let _ = if trace() then print_debug(format(f'- InstLAllR ~p :=< ~p in ~p', {e_a, b, (nu_b :: context)})) else {} in
+            let delta_etc = instantiate_l((nu_b :: context), e_a, b, next_id_ref) in
+            peel(delta_etc, nu_b)
+          else
+            inst_l_fail()
+        | _ -> inst_l_fail()
+      end
+  
+  and instantiate_r(context, a, e_a, next_id_ref) =
+    let ne_a = NExistential(e_a) in
+    let inst_r_fail = fun() -> failwith(format(f'Failed to instantiate ~p to ~p~n (context: ~p)', {a, e_a, context})) end in
+    if if is_mono(a) then is_well_formed(peel(context, ne_a), a) else false then
+      let {post_context, pre_context} = split(context, ne_a) in
+      let _ = if trace() then print_debug(format(f'- InstRSolve ~p :=< ~p', {a, e_a})) else {} in
+      Stdlib.List.append(post_context, (NSolved(e_a, a) :: pre_context))
+    else
+      case a of
+        | TExistential(e_c) ->
+          if list_contains(ne_a, peel(context, NExistential(e_c))) then
+            let {post_context, pre_context} = split(context, NExistential(e_c)) in
+            let _ = if trace() then print_debug(format(f'- InstRReach ~p :=< ~p', {e_c, e_a})) else {} in
+            Stdlib.List.append(post_context, (NSolved(e_c, TExistential(e_a)) :: pre_context))
+          else
+            inst_r_fail()
+        | TFunction(a1, a2) ->
+          if list_contains(ne_a, context) then
+            let {post_context, pre_context} = split(context, ne_a) in
+            let e_a1 = fresh_e_var("a₁", next_id_ref) in
+            let e_a2 = fresh_e_var("a₂", next_id_ref) in
+            let ne_a1 = NExistential(e_a1) in
+            let te_a1 = TExistential(e_a1) in
+            let ne_a2 = NExistential(e_a2) in
+            let te_a2 = TExistential(e_a2) in
+            let a1context = Stdlib.List.append(post_context, (NSolved(e_a, TFunction(te_a1, te_a2)) :: ne_a1 :: ne_a2 :: pre_context)) in
+            let _ = if trace() then print_debug(format(f'- InstRArr(1) ~p :=< ~p in ~p', {e_a1, a1, a1context})) else {} in
+            let theta = instantiate_l(a1context, e_a1, a1, next_id_ref) in
+            let _ = if trace() then print_debug(format(f'- InstRArr(2) ~p :=< ~p in ~p', {apply(theta, a2), e_a2, theta})) else {} in
+            instantiate_r(theta, apply(theta, a2), e_a2, next_id_ref)
+          else
+            inst_r_fail()
+        | TQuantification(u_b, b) ->
+          if list_contains(ne_a, context) then
+            let e_c = fresh_e_var("c", next_id_ref) in
+            let inst_context = NExistential(e_c) :: NMarker(e_c) :: context in
+            let _ = if trace() then print_debug(format(f'- InstRAllL [~p/~p]~p :=< ~p in ~p', {e_c, u_b, b, e_a, inst_context})) else {} in
+            let b_subst = subst(TExistential(e_c), TVariable(u_b), b) in
+            let delta_etc = instantiate_r(inst_context, b_subst, e_a, next_id_ref) in
+            peel(delta_etc, NMarker(e_c))
+          else
+            inst_r_fail()
+        | _ -> inst_r_fail()
+      end
+  
+  val rec subtype(context, typ_a, typ_b, next_id_ref) =
+    let a_evar_l = case typ_a of
+      | TExistential(e_a) -> if list_contains(NExistential(e_a), context) then Stdlib.Bool.not(contains_free(typ_b, e_a)) else false
+      | _ -> false
+    end in
+    let b_evar_l = case typ_b of
+      | TExistential(e_a) -> if list_contains(NExistential(e_a), context) then Stdlib.Bool.not(contains_free(typ_a, e_a)) else false
+      | _ -> false
+    end in
+    case {typ_a, typ_b, equal(typ_a, typ_b), a_evar_l, b_evar_l} of
+      | {TUnit, TUnit, _, _, _} -> context
+      | {TVariable(_), TVariable(_), true, _, _} -> context
+      | {TExistential(e_a), TExistential(_), true, _, _} ->
+        if list_contains(NExistential(e_a), context) then context
+        else failwith(format(f'Unbound existential ~p', {typ_a}))
+      | {TFunction(a1, a2), TFunction(b1, b2), _, _, _} ->
+        let theta = subtype(context, b1, a1, next_id_ref) in
+        subtype(theta, apply(theta, a2), apply(theta, b2), next_id_ref)
+      | {TQuantification(u_a, a), b, _, _, _} ->
+        let e_a = fresh_e_var("a", next_id_ref) in
+        let e_a_mark = NMarker(e_a) in
+        let sub_context = NExistential(e_a) :: e_a_mark :: context in
+        let delta_etc = subtype(sub_context, subst(TExistential(e_a), TVariable(u_a), a), b, next_id_ref) in
+        peel(delta_etc, e_a_mark)
+      | {a, TQuantification(u_a, b), _, _, _} ->
+        let nu_a = NVariable(u_a) in
+        let delta_etc = subtype(nu_a :: context, a, b, next_id_ref) in
+        peel(delta_etc, nu_a)
+      | {TExistential(e_a), a, _, true, _} ->
+        let _ = if trace() then print_debug(format(f'- <:InstL ~p :=< ~p', {e_a, a})) else {} in
+        instantiate_l(context, e_a, a, next_id_ref)
+      | {a, TExistential(e_a), _, _, true} ->
+        let _ = if trace() then print_debug(format(f'- <:InstR ~p :=< ~p', {a, e_a})) else {} in
+        instantiate_r(context, a, e_a, next_id_ref)
+      | _ -> failwith(format(f'Type mismatch: expressionected ~p, given: ~p', {typ_b, typ_a}))
+    end
+  
+  val rec check(context, expression, typ, next_id_ref) =
+    case {expression, typ} of
+      | {XUnit, TUnit} -> {expression, context}
+      | {XAbstraction(arg, _, body), TFunction(arg_t, body_t)} ->
+        let arg_assump = NTypedVariable(arg, arg_t) in
+        let _ = if trace() then print_debug(format(f'- ->I (~p <= ~p) in ~p', {body, body_t, arg_assump :: context})) else {} in
+        let {checked_body, delta_etc} = check(arg_assump :: context, body, body_t, next_id_ref) in
+        let delta = peel(delta_etc, arg_assump) in
+        {XAbstraction(arg, arg_t, checked_body), delta}
+      | {expression, TQuantification(u_a, typ)} ->
+        let nu_a = NVariable(u_a) in
+        let _ = if trace() then print_debug(format(f'- ∀I (~p <= ~p) in ~p', {expression, typ, nu_a :: context})) else {} in
+        let {checked_expression, delta_etc} = check(nu_a :: context, expression, typ, next_id_ref) in
+        {checked_expression, peel(delta_etc, nu_a)}
+      | {expression, typ} ->
+        let {expression_type, checked_expression, theta} = infer(context, expression, next_id_ref) in
+        let _ = if trace() then print_debug(format(f'- Sub (~p -> ~p) ; [Θ]~p <: [Θ]~p in ~p', {expression, expression_type, expression_type, typ, theta})) else {} in
+        let delta = subtype(theta, apply(theta, expression_type), apply(theta, typ), next_id_ref) in
+        {apply_expression(delta, checked_expression), delta}
+    end
+  
+  and infer(context, expression, next_id_ref) =
+    case expression of
+      | XUnit -> {TUnit, expression, context}
+      | XVariable(name, _) ->
+        case assump(context, name) of
+          | Some(typ) -> {typ, XVariable(name, typ), context}
+          | None      -> failwith(format(f'No binding for variable ~s', {name}))
+        end
+      | XLet(x, expression, body) ->
+        let {expression_type, inferred_expression, theta} = infer(context, expression, next_id_ref) in
+        let e_c = fresh_e_var("c", next_id_ref) in
+        let te_c = TExistential(e_c) in
+        let assump = NTypedVariable(x, expression_type) in
+        let check_context = assump :: NExistential(e_c) :: theta in
+        let _ = if trace() then print_debug(format(f'- Let-> (~p <= ~p) in ~p', {body, e_c, check_context})) else {} in
+        let {checked_body, checked_context} = check(check_context, body, te_c, next_id_ref) in
+        {te_c, XLet(x, inferred_expression, checked_body), peel(checked_context, assump)}
+      | XAbstraction(arg, _, body) ->
+        let e_a = fresh_e_var("a", next_id_ref) in
+        let e_c = fresh_e_var("c", next_id_ref) in
+        let te_a = TExistential(e_a) in
+        let te_c = TExistential(e_c) in
+        let assump = NTypedVariable(arg, te_a) in
+        let check_context = assump :: NExistential(e_c) :: NExistential(e_a) :: context in
+        let _ = if trace() then print_debug(format(f'- ->I=> (~p <= ~p) in ~p', {body, e_c, check_context})) else {} in
+        let {checked_body, checked_context} = check(check_context, body, te_c, next_id_ref) in
+        {TFunction(te_a, te_c), XAbstraction(arg, te_a, checked_body), peel(checked_context, assump)}
+      | XApplication(fn, arg, _) ->
+        let {fun_type, checked_fun, theta} = infer(context, fn, next_id_ref) in
+        let reduced_fun = apply(theta, fun_type) in
+        let _ = if trace() then print_debug(format(f'- ->E ~p -> ~p ; ~p ● ~p in ~p', {fn, fun_type, reduced_fun, arg, theta})) else {} in
+        let {res_type, checked_arg, delta} = infer_app(theta, reduced_fun, arg, next_id_ref) in
+        {res_type, XApplication(checked_fun, checked_arg, res_type), delta}
+      | XAnnotation(x, ann) ->
+        let {checked_expression, delta} = check(context, x, ann, next_id_ref) in
+        {ann, checked_expression, delta}
+    end
+  
+  and infer_app(context, fn, expression, next_id_ref) =
+    case fn of
+      | TQuantification(uv, typ) ->
+        let e_a = fresh_e_var("a", next_id_ref) in
+        let reduced = subst(TExistential(e_a), TVariable(uv), typ) in
+        let app_context = NExistential(e_a) :: context in
+        let _ = if trace() then print_debug(format(f'- ∀App ~p ● ~p in ~p', {reduced, expression, app_context})) else {} in
+        infer_app(app_context, reduced, expression, next_id_ref)
+      | TExistential(e_a) ->
+        let a1 = fresh_e_var("a₁", next_id_ref) in
+        let a2 = fresh_e_var("a₂", next_id_ref) in
+        let a_arrow = TFunction(TExistential(a1), TExistential(a2)) in
+        let {post_context, pre_context} = split(context, NExistential(e_a)) in
+        let check_context = Stdlib.List.append(post_context, NSolved(e_a, a_arrow) :: NExistential(a1) :: NExistential(a2) :: pre_context) in
+        let _ = if trace() then print_debug(format(f'- âApp ~p <= ~p in ~p', {expression, a1, check_context})) else {} in
+        let {checked_expression, delta} = check(check_context, expression, TExistential(a1), next_id_ref) in
+        {TExistential(a2), checked_expression, delta}
+      | TFunction(arg_t, res_t) ->
+        let {checked_expression, delta} = check(context, expression, arg_t, next_id_ref) in
+        {res_t, checked_expression, delta}
+      | fn -> failwith(format(f'Cannot apply expression of type ~p to ~p', {fn, expression}))
+    end
+
+  val infer_expression(expression) =
+    let next_id_ref = init_next_id() in
+    let _ = inc_counter_value(next_id_ref) in
+    let _ = if trace() then print_debug(format(f'inferExpr ~p', {expression})) else {} in
+    let {_, inf_expression, delta} = infer([], expression, next_id_ref) in
+    let _ = if trace() then print_debug(format(f'∆ = ~p', {delta})) else {} in
+    let ident = "my expression" in
+    let _ = if trace() then print_debug(format(f'~s: ~p~n', {ident, inf_expression})) else {} in
+    apply_expression(delta, inf_expression)
+end
+
