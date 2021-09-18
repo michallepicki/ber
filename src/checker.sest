@@ -1,7 +1,9 @@
+/* ported from https://github.com/samskivert/bidir-fsharp/blob/8ee79cf333c77af6fb964e68cab3a9c1e058ee54/checker/Library.fs */
 module Checker = struct
   
   val trace() = true
 
+  /* types (A,B,C): 1 | α | â | ∀α.A | A→B */
   type typ =
     | TUnset
     | TUnit
@@ -10,6 +12,7 @@ module Checker = struct
     | TQuantification(binary, typ)
     | TFunction(typ, typ)
 
+  /* terms (x): () | x | λx.e | e e | e:A */
   type expr =
     | XVariable(binary, typ)
     | XUnit
@@ -18,6 +21,7 @@ module Checker = struct
     | XAnnotation(expr, typ)
     | XLet(binary, expr, expr)
 
+  /* Returns the type of the AST node `exprType`. */
   val rec expression_type(expression : expr) : typ =
     case expression of
       | XUnit -> TUnit
@@ -28,6 +32,7 @@ module Checker = struct
       | XLet(_, _, body) -> expression_type(body)
     end
 
+  /* contexts (Γ,∆,Θ): · | Γ,α | Γ,x:A | Γ,â | Γ,â = τ | Γ,▶â */
   type note =
     | NVariable(binary)
     | NExistential(binary)
@@ -39,6 +44,8 @@ module Checker = struct
     failwith(Message) -> erlang:error(Message).
   ```
 
+  /* a context is an ordered list of notes (note: the head of the list is the most recently added */
+  /* note, which is opposite the lexical representation in the paper) */
   val one_note(context, w, v, p) =
     case Stdlib.List.foldl(p, [], context) of
       | []   -> None
@@ -46,6 +53,7 @@ module Checker = struct
       | ats  -> failwith(format(f'Multiple ~s for ~s: ~p', {w, v, ats}))
     end
   
+  /* Looks up the assumption for variable `v` in `ctx`. */
   val assump(context, v) =
     one_note(context, "assumptions", v, fun(acc, note) ->
         let x = case note of
@@ -55,6 +63,7 @@ module Checker = struct
         Stdlib.List.append(x, acc)
       end)
   
+  /* Looks up the solution for existential variable `ev` in `ctx`. */
   val solution(context, ev) =
     one_note(context, "solutions", ev, fun(acc, note) ->
         let x = case note of
@@ -68,6 +77,7 @@ module Checker = struct
     equal(A, B) -> A == B.
   ```
 
+  /* Peels off the end of a context up to and including `note`. */
   val rec peel(context, note) =
     case context of
       | [] -> []
@@ -80,9 +90,14 @@ module Checker = struct
       | h :: t -> if equal(h, note) then {Stdlib.List.reverse(left), t} else splitacc(context, (h :: left), t, note)
     end
 
+  /* Splits `ctx` into the part after `note` and the part before. `note` itself is not included. */
+  /* Recall that contexts list notes in reverse order, hence the `(post, pre)` return order. */
+  /* If `note` is not in `ctx` then `None` is returned. */
   val split(context, note) =
     splitacc(context, [], context, note)
   
+
+  /* Returns whether `eV` is in the free variables of `tpe`. */
   val rec contains_free(typ, ev) =
     case typ of
       | TExistential(v) -> equal(v, ev)
@@ -123,6 +138,7 @@ module Checker = struct
 
   val is_well_formed(context, typ) = if is_some(check_malformed(context, typ)) then false else true
 
+  /* Applies `ctx` to `tpe` (substituting existential vars for their solutions). */
   val rec apply(context, t) =
     case t of
       | TExistential(ev) -> 
@@ -145,6 +161,7 @@ module Checker = struct
       | expression -> expression
     end
   
+  /* Returns `arg` with `thatT` replaced by `thisT`. */
   val rec subst(thist, thatt, arg) =
     case arg of
       | TVariable(_)      -> if equal(thatt, arg) then thist else arg
@@ -174,22 +191,30 @@ module Checker = struct
     let _ = print_debug(format(f'~s~p~n', {name, next_id})) in
     next_id
 
+  /* Instantiates `eA` such that `eA <: a` in `ctx`. See Figure 10. */
+  /* @return the output context. */
   val rec instantiate_l(context, e_a, a, next_id_ref) =
     let ne_a = NExistential(e_a) in
     let inst_l_fail = fun() -> failwith(format(f'Failed to instantiate ~p to ~p', {e_a, a})) end in
-    if if is_mono(a) then is_well_formed(peel(context, ne_a), a) else false then
+    
+    /* InstLSolve :: Γ,â,Γ′ ⊢ â :=< τ ⊣ Γ,â=τ,Γ′ */
+    if if is_mono(a) then is_well_formed(peel(context, ne_a), a) else false then /* Γ ⊢ τ */
       let {post_context, pre_context} = split(context, ne_a) in
       let _ = if trace() then print_debug(format(f'- InstLSolve ~p :=< ~p', {e_a, a})) else {} in
-      Stdlib.List.append(post_context, (NSolved(e_a, a) :: pre_context))
+      Stdlib.List.append(post_context, (NSolved(e_a, a) :: pre_context)) /* Γ,â=τ,Γ′ */
     else
       case a of
+
+        /* InstLReach :: Γ[â][ĉ] ⊢ â :=< ĉ ⊣ Γ[â][ĉ=â] */
         | TExistential(e_c) ->
           if list_contains(ne_a, peel(context, NExistential(e_c))) then
             let {post_context, pre_context} = split(context, NExistential(e_c)) in
             let _ = if trace() then print_debug(format(f'- InstLReach ~p :=< ~p', {e_a, e_c})) else {} in
-            Stdlib.List.append(post_context, (NSolved(e_c, TExistential(e_a)) :: pre_context))
+            Stdlib.List.append(post_context, (NSolved(e_c, TExistential(e_a)) :: pre_context)) /* Γ[â][ĉ=â] */
           else
             inst_l_fail()
+        
+        /* InstLArr :: Γ[â] ⊢ â :=< A1 → A2 ⊣ ∆ */
         | TFunction(a1, a2) ->
           if list_contains(ne_a, context) then
             let {post_context, pre_context} = split(context, ne_a) in
@@ -201,38 +226,46 @@ module Checker = struct
             let te_a2 = TExistential(e_a2) in
             let a1context = Stdlib.List.append(post_context, (NSolved(e_a, TFunction(te_a1, te_a2)) :: ne_a1 :: ne_a2 :: pre_context)) in
             let _ = if trace() then print_debug(format(f'- InstLArr(1) ~p :=< ~p in ~p', {a1, e_a1, a1context})) else {} in
-            let theta = instantiate_r(a1context, a1, e_a1, next_id_ref) in
+            let theta = instantiate_r(a1context, a1, e_a1, next_id_ref) in /* Γ[â₂,â₁,â=â₁→â2] ⊢ A1 :=< â₁ ⊣ Θ */
             let _ = if trace() then print_debug(format(f'- InstRArr(2) ~p :=< ~p in ~p', {e_a2, apply(theta, a2), theta})) else {} in
-            instantiate_l(theta, e_a2, apply(theta, a2), next_id_ref)
+            instantiate_l(theta, e_a2, apply(theta, a2), next_id_ref) /* Θ ⊢ â₂ :=< [Θ]A2 ⊣ ∆ */
           else
             inst_l_fail()
+        
+        /* InstLAllR :: Γ[â] ⊢ â :=< ∀β.B ⊣ ∆ */
         | TQuantification(u_b, b) ->
           if list_contains(ne_a, context) then
             let nu_b = NVariable(u_b) in
             let _ = if trace() then print_debug(format(f'- InstLAllR ~p :=< ~p in ~p', {e_a, b, (nu_b :: context)})) else {} in
-            let delta_etc = instantiate_l((nu_b :: context), e_a, b, next_id_ref) in
-            peel(delta_etc, nu_b)
+            let delta_etc = instantiate_l((nu_b :: context), e_a, b, next_id_ref) in /* Γ[â],β ⊢ â :=< B ⊣ ∆,β,∆′ */
+            peel(delta_etc, nu_b) /* ∆ */
           else
             inst_l_fail()
         | _ -> inst_l_fail()
       end
   
+  /* Instantiates `eA` such that `a <: eA` in `ctx`. See Figure 10. */
+  /* @return the output context. */
   and instantiate_r(context, a, e_a, next_id_ref) =
     let ne_a = NExistential(e_a) in
     let inst_r_fail = fun() -> failwith(format(f'Failed to instantiate ~p to ~p~n (context: ~p)', {a, e_a, context})) end in
-    if if is_mono(a) then is_well_formed(peel(context, ne_a), a) else false then
+    /* InstRSolve :: Γ,â,Γ′ ⊢ τ :=< â ⊣ Γ,â=τ,Γ′ */
+    if if is_mono(a) then is_well_formed(peel(context, ne_a), a) else false then  /* Γ ⊢ τ */
       let {post_context, pre_context} = split(context, ne_a) in
       let _ = if trace() then print_debug(format(f'- InstRSolve ~p :=< ~p', {a, e_a})) else {} in
-      Stdlib.List.append(post_context, (NSolved(e_a, a) :: pre_context))
+      Stdlib.List.append(post_context, (NSolved(e_a, a) :: pre_context)) /* Γ,â=τ,Γ′ */
     else
       case a of
+        /* InstRReach :: Γ[â][ĉ] ⊢ ĉ :=< â ⊣ Γ[â][ĉ=â] */
         | TExistential(e_c) ->
           if list_contains(ne_a, peel(context, NExistential(e_c))) then
             let {post_context, pre_context} = split(context, NExistential(e_c)) in
             let _ = if trace() then print_debug(format(f'- InstRReach ~p :=< ~p', {e_c, e_a})) else {} in
-            Stdlib.List.append(post_context, (NSolved(e_c, TExistential(e_a)) :: pre_context))
+            Stdlib.List.append(post_context, (NSolved(e_c, TExistential(e_a)) :: pre_context)) /* Γ[â][ĉ = â] */
           else
             inst_r_fail()
+        
+        /* InstRArr :: Γ[â] ⊢ A1 → A2 :=< â ⊣ ∆ */
         | TFunction(a1, a2) ->
           if list_contains(ne_a, context) then
             let {post_context, pre_context} = split(context, ne_a) in
@@ -244,24 +277,28 @@ module Checker = struct
             let te_a2 = TExistential(e_a2) in
             let a1context = Stdlib.List.append(post_context, (NSolved(e_a, TFunction(te_a1, te_a2)) :: ne_a1 :: ne_a2 :: pre_context)) in
             let _ = if trace() then print_debug(format(f'- InstRArr(1) ~p :=< ~p in ~p', {e_a1, a1, a1context})) else {} in
-            let theta = instantiate_l(a1context, e_a1, a1, next_id_ref) in
+            let theta = instantiate_l(a1context, e_a1, a1, next_id_ref) in /* Γ[â₂,â₁,â=â₁→â₂] ⊢ â₁ :=< A1 ⊣ Θ */
             let _ = if trace() then print_debug(format(f'- InstRArr(2) ~p :=< ~p in ~p', {apply(theta, a2), e_a2, theta})) else {} in
-            instantiate_r(theta, apply(theta, a2), e_a2, next_id_ref)
+            instantiate_r(theta, apply(theta, a2), e_a2, next_id_ref) /* Θ ⊢ [Θ]A2 :=< â₂ ⊣ ∆ */
           else
             inst_r_fail()
+
+        /* InstRAllL :: Γ[â],▶ĉ,ĉ ⊢ [ĉ/β]B :=< â ⊣ ∆,▶ĉ,∆′ */
         | TQuantification(u_b, b) ->
           if list_contains(ne_a, context) then
             let e_c = fresh_e_var("c", next_id_ref) in
-            let inst_context = NExistential(e_c) :: NMarker(e_c) :: context in
+            let inst_context = NExistential(e_c) :: NMarker(e_c) :: context in /* Γ[â],▶ĉ,ĉ */
             let _ = if trace() then print_debug(format(f'- InstRAllL [~p/~p]~p :=< ~p in ~p', {e_c, u_b, b, e_a, inst_context})) else {} in
             let b_subst = subst(TExistential(e_c), TVariable(u_b), b) in
-            let delta_etc = instantiate_r(inst_context, b_subst, e_a, next_id_ref) in
-            peel(delta_etc, NMarker(e_c))
+            let delta_etc = instantiate_r(inst_context, b_subst, e_a, next_id_ref) in /* Γic ⊢ [ĉ/β]B :=< â ⊣ ∆,▶ĉ,∆′ */
+            peel(delta_etc, NMarker(e_c)) /* ∆ */
           else
             inst_r_fail()
         | _ -> inst_r_fail()
       end
   
+  /* Derives a subtyping relationship `tpeA <: tpeB` with input context `ctx`. See Figure 9. */
+  /* @return the output context. */
   val rec subtype(context, typ_a, typ_b, next_id_ref) =
     let a_evar_l = case typ_a of
       | TExistential(e_a) -> if list_contains(NExistential(e_a), context) then Stdlib.Bool.not(contains_free(typ_b, e_a)) else false
@@ -271,124 +308,164 @@ module Checker = struct
       | TExistential(e_a) -> if list_contains(NExistential(e_a), context) then Stdlib.Bool.not(contains_free(typ_a, e_a)) else false
       | _ -> false
     end in
+    /* <:Unit :: Γ ⊢ 1 <: 1 ⊣ Γ */
     case {typ_a, typ_b, equal(typ_a, typ_b), a_evar_l, b_evar_l} of
       | {TUnit, TUnit, _, _, _} -> context
-      | {TVariable(_), TVariable(_), true, _, _} -> context
+      /* <:Var :: Γ[α] ⊢ α <: α ⊣ Γ[α] */
+      | {TVariable(_), TVariable(_), true, _, _} -> context /* Γ */
+      /* <:Exvar :: Γ[â] ⊢ â <: â ⊣ Γ[â] */
       | {TExistential(e_a), TExistential(_), true, _, _} ->
-        if list_contains(NExistential(e_a), context) then context
+        if list_contains(NExistential(e_a), context) then context /* Γ */
         else failwith(format(f'Unbound existential ~p', {typ_a}))
+      /* <:→ :: Γ ⊢ A1→A2 <: B1→B2 ⊣ ∆ */
       | {TFunction(a1, a2), TFunction(b1, b2), _, _, _} ->
-        let theta = subtype(context, b1, a1, next_id_ref) in
-        subtype(theta, apply(theta, a2), apply(theta, b2), next_id_ref)
+        let theta = subtype(context, b1, a1, next_id_ref) in /* Γ ⊢ B1 <: A1 ⊣ Θ */
+        subtype(theta, apply(theta, a2), apply(theta, b2), next_id_ref) /* Θ ⊢ [Θ]A2 <: [Θ]B2 ⊣ ∆ */
+      /* <:∀L :: Γ ⊢ ∀α.A <: B ⊣ ∆ */
       | {TQuantification(u_a, a), b, _, _, _} ->
         let e_a = fresh_e_var("a", next_id_ref) in
         let e_a_mark = NMarker(e_a) in
-        let sub_context = NExistential(e_a) :: e_a_mark :: context in
-        let delta_etc = subtype(sub_context, subst(TExistential(e_a), TVariable(u_a), a), b, next_id_ref) in
-        peel(delta_etc, e_a_mark)
+        let sub_context = NExistential(e_a) :: e_a_mark :: context in /* Γ,▶â,â */
+        let delta_etc = subtype(sub_context, subst(TExistential(e_a), TVariable(u_a), a), b, next_id_ref) in /* [â/α]A <: B ⊣ ∆,▶â,Θ */
+        peel(delta_etc, e_a_mark) /* ∆ */
+      /* <:∀R :: Γ ⊢ A <: ∀α.B ⊣ ∆ */
       | {a, TQuantification(u_a, b), _, _, _} ->
         let nu_a = NVariable(u_a) in
-        let delta_etc = subtype(nu_a :: context, a, b, next_id_ref) in
-        peel(delta_etc, nu_a)
+        let delta_etc = subtype(nu_a :: context, a, b, next_id_ref) in /* Γ,α ⊢ A <: B ⊣ ∆,α,Θ */
+        peel(delta_etc, nu_a) /* ∆ */
+      /* <:InstantiateL :: Γ[â] ⊢ â <: A ⊣ ∆ */
       | {TExistential(e_a), a, _, true, _} ->
         let _ = if trace() then print_debug(format(f'- <:InstL ~p :=< ~p', {e_a, a})) else {} in
-        instantiate_l(context, e_a, a, next_id_ref)
+        instantiate_l(context, e_a, a, next_id_ref) /* Γ[â] ⊢ â :=< A ⊣ ∆ */
+      /* <:InstantiateR :: Γ[â] ⊢ A <: â ⊣ ∆ */
       | {a, TExistential(e_a), _, _, true} ->
         let _ = if trace() then print_debug(format(f'- <:InstR ~p :=< ~p', {a, e_a})) else {} in
-        instantiate_r(context, a, e_a, next_id_ref)
+        instantiate_r(context, a, e_a, next_id_ref) /* Γ[â] ⊢ A <: â ⊣ ∆ */
       | _ -> failwith(format(f'Type mismatch: expressionected ~p, given: ~p', {typ_b, typ_a}))
     end
   
+  /* Checks that `exp` has type `tpe` with input context `ctx`. See Figure 11. */
+  /* @return the term with type assigned, and the output context. */
   val rec check(context, expression, typ, next_id_ref) =
     case {expression, typ} of
-      | {XUnit, TUnit} -> {expression, context}
+      /* 1I :: ((), 1) */
+      | {XUnit, TUnit} -> {expression, context} /* Γ */
+      /* ->I :: (λx.e, A→B) */
       | {XAbstraction(arg, _, body), TFunction(arg_t, body_t)} ->
-        let arg_assump = NTypedVariable(arg, arg_t) in
+        /* exp.tpe = tpe  // lambda types are not always synthesized, so we also assign lambda AST */
+        /* arg.tpe = argT // nodes a type during checking, ditto for the lambda argument nodes */
+        let arg_assump = NTypedVariable(arg, arg_t) in /* x:A */
         let _ = if trace() then print_debug(format(f'- ->I (~p <= ~p) in ~p', {body, body_t, arg_assump :: context})) else {} in
-        let {checked_body, delta_etc} = check(arg_assump :: context, body, body_t, next_id_ref) in
-        let delta = peel(delta_etc, arg_assump) in
+        let {checked_body, delta_etc} = check(arg_assump :: context, body, body_t, next_id_ref) in /* Γ,x:A ⊢ e ⇐ B ⊣ ∆,x:A,Θ */
+        let delta = peel(delta_etc, arg_assump) in /* ∆ */
         {XAbstraction(arg, arg_t, checked_body), delta}
+      /* ∀I :: (e, ∀α.A) */
       | {expression, TQuantification(u_a, typ)} ->
         let nu_a = NVariable(u_a) in
         let _ = if trace() then print_debug(format(f'- ∀I (~p <= ~p) in ~p', {expression, typ, nu_a :: context})) else {} in
-        let {checked_expression, delta_etc} = check(nu_a :: context, expression, typ, next_id_ref) in
-        {checked_expression, peel(delta_etc, nu_a)}
+        let {checked_expression, delta_etc} = check(nu_a :: context, expression, typ, next_id_ref) in /* Γ,α ⊢ e ⇐ A ⊣ ∆,α,Θ */
+        {checked_expression, peel(delta_etc, nu_a)} /* ∆ */
+      /* Sub :: (e, B) */
       | {expression, typ} ->
-        let {expression_type, checked_expression, theta} = infer(context, expression, next_id_ref) in
+        let {expression_type, checked_expression, theta} = infer(context, expression, next_id_ref) in /* Γ ⊢ e ⇒ A ⊣ Θ */
         let _ = if trace() then print_debug(format(f'- Sub (~p -> ~p) ; [Θ]~p <: [Θ]~p in ~p', {expression, expression_type, expression_type, typ, theta})) else {} in
         let delta = subtype(theta, apply(theta, expression_type), apply(theta, typ), next_id_ref) in
-        {apply_expression(delta, checked_expression), delta}
+        /* apply the solutions from subtyping to our subtree, otherwise we can be left with temporary */
+        /* type variables in type checked subtrees */
+        {apply_expression(delta, checked_expression), delta} /* Θ ⊢ [Θ]A <: [Θ]B ⊣ ∆ */
     end
-  
+
+  /* Infers a type for `exp` with input context `ctx`. See Figure 11. */
+  /* @return the inferred type, the term with type assigned, and the output context. */
   and infer(context, expression, next_id_ref) =
     case expression of
-      | XUnit -> {TUnit, expression, context}
+      /* 1I=> :: () */
+      | XUnit -> {TUnit, expression, context} /* 1 ⊣ Γ */
+      /* Var :: x */
       | XVariable(name, _) ->
         case assump(context, name) of
-          | Some(typ) -> {typ, XVariable(name, typ), context}
+          | Some(typ) -> {typ, XVariable(name, typ), context} /* A ⊣ Γ */
           | None      -> failwith(format(f'No binding for variable ~s', {name}))
         end
+      /* Let-> :: let x = exp in body */
       | XLet(x, expression, body) ->
         let {expression_type, inferred_expression, theta} = infer(context, expression, next_id_ref) in
         let e_c = fresh_e_var("c", next_id_ref) in
         let te_c = TExistential(e_c) in
         let assump = NTypedVariable(x, expression_type) in
+      /* x.tpe = expType // assign type to var node, which is not separately entyped */
         let check_context = assump :: NExistential(e_c) :: theta in
         let _ = if trace() then print_debug(format(f'- Let-> (~p <= ~p) in ~p', {body, e_c, check_context})) else {} in
         let {checked_body, checked_context} = check(check_context, body, te_c, next_id_ref) in
         {te_c, XLet(x, inferred_expression, checked_body), peel(checked_context, assump)}
+      /* ->I=> :: λx.e */
       | XAbstraction(arg, _, body) ->
+        /* â, ĉ */
         let e_a = fresh_e_var("a", next_id_ref) in
         let e_c = fresh_e_var("c", next_id_ref) in
         let te_a = TExistential(e_a) in
         let te_c = TExistential(e_c) in
-        let assump = NTypedVariable(arg, te_a) in
-        let check_context = assump :: NExistential(e_c) :: NExistential(e_a) :: context in
+        let assump = NTypedVariable(arg, te_a) in /* x:â */
+        /* arg.tpe = eA // assign type to arg node, which is not separately entyped */
+        let check_context = assump :: NExistential(e_c) :: NExistential(e_a) :: context in /* Γ,â,ĉ,x:â */
         let _ = if trace() then print_debug(format(f'- ->I=> (~p <= ~p) in ~p', {body, e_c, check_context})) else {} in
-        let {checked_body, checked_context} = check(check_context, body, te_c, next_id_ref) in
-        {TFunction(te_a, te_c), XAbstraction(arg, te_a, checked_body), peel(checked_context, assump)}
+        let {checked_body, checked_context} = check(check_context, body, te_c, next_id_ref) in /* e ⇐ ĉ ⊣ ∆,x:â,Θ */
+        {TFunction(te_a, te_c), XAbstraction(arg, te_a, checked_body), peel(checked_context, assump)} /* â→ĉ ⊣ ∆ */
+      /* ->E :: (e1 e2) */
       | XApplication(fn, arg, _) ->
-        let {fun_type, checked_fun, theta} = infer(context, fn, next_id_ref) in
-        let reduced_fun = apply(theta, fun_type) in
+        let {fun_type, checked_fun, theta} = infer(context, fn, next_id_ref) in /* e1 ⇒ A ⊣ Θ */
+        let reduced_fun = apply(theta, fun_type) in /* [Θ]A */
         let _ = if trace() then print_debug(format(f'- ->E ~p -> ~p ; ~p ● ~p in ~p', {fn, fun_type, reduced_fun, arg, theta})) else {} in
-        let {res_type, checked_arg, delta} = infer_app(theta, reduced_fun, arg, next_id_ref) in
+        let {res_type, checked_arg, delta} = infer_app(theta, reduced_fun, arg, next_id_ref) in /* C ⊣ ∆ */
+        /* fn.apply(delta) */
         {res_type, XApplication(checked_fun, checked_arg, res_type), delta}
+      /* Anno: x:A */
       | XAnnotation(x, ann) ->
+        /* ann.checkWellFormed */
         let {checked_expression, delta} = check(context, x, ann, next_id_ref) in
-        {ann, checked_expression, delta}
+        {ann, checked_expression, delta} /* A ⊣ ∆ */
     end
-  
+
+  /* Infers the type of an application of a function of type `fun` to `exp`. See Figure 11. */
+  /* @return the inferred type, the term with type assigned, and the output context. */
   and infer_app(context, fn, expression, next_id_ref) =
     case fn of
+      /* ∀App */
       | TQuantification(uv, typ) ->
-        let e_a = fresh_e_var("a", next_id_ref) in
-        let reduced = subst(TExistential(e_a), TVariable(uv), typ) in
-        let app_context = NExistential(e_a) :: context in
+        let e_a = fresh_e_var("a", next_id_ref) in /* â */
+        let reduced = subst(TExistential(e_a), TVariable(uv), typ) in /* [â/α]A */
+        let app_context = NExistential(e_a) :: context in /* Γ,â */
         let _ = if trace() then print_debug(format(f'- ∀App ~p ● ~p in ~p', {reduced, expression, app_context})) else {} in
-        infer_app(app_context, reduced, expression, next_id_ref)
+        infer_app(app_context, reduced, expression, next_id_ref) /* C ⊣ ∆ */
+      /* âApp */
       | TExistential(e_a) ->
-        let a1 = fresh_e_var("a₁", next_id_ref) in
-        let a2 = fresh_e_var("a₂", next_id_ref) in
-        let a_arrow = TFunction(TExistential(a1), TExistential(a2)) in
-        let {post_context, pre_context} = split(context, NExistential(e_a)) in
-        let check_context = Stdlib.List.append(post_context, NSolved(e_a, a_arrow) :: NExistential(a1) :: NExistential(a2) :: pre_context) in
+        let a1 = fresh_e_var("a₁", next_id_ref) in /* â₁ */
+        let a2 = fresh_e_var("a₂", next_id_ref) in /* â₂ */
+        let a_arrow = TFunction(TExistential(a1), TExistential(a2)) in /* â₁→â₂ */
+        let {post_context, pre_context} = split(context, NExistential(e_a)) in /* Γpre[â]post */
+        let check_context = Stdlib.List.append(post_context, NSolved(e_a, a_arrow) :: NExistential(a1) :: NExistential(a2) :: pre_context) in /* Γpre[â₂,â₁,â=â₁→â₂]post */
         let _ = if trace() then print_debug(format(f'- âApp ~p <= ~p in ~p', {expression, a1, check_context})) else {} in
         let {checked_expression, delta} = check(check_context, expression, TExistential(a1), next_id_ref) in
-        {TExistential(a2), checked_expression, delta}
-      | TFunction(arg_t, res_t) ->
+        {TExistential(a2), checked_expression, delta} /* â₂ ⊣ ∆ */
+      /* ->App */
+      | TFunction(arg_t, res_t) -> /* A→C */
         let {checked_expression, delta} = check(context, expression, arg_t, next_id_ref) in
-        {res_t, checked_expression, delta}
+        {res_t, checked_expression, delta} /* C ⊣ ∆∆ */
+      /* <fail> */
       | fn -> failwith(format(f'Cannot apply expression of type ~p to ~p', {fn, expression}))
     end
 
+  /* Runs inference on `expr` and returns the term with type assigned or throws an error. */
   val infer_expression(expression) =
-    let next_id_ref = init_next_id() in
-    let _ = inc_counter_value(next_id_ref) in
+    let next_id_ref = init_next_id() in /* makes error messages less arbitrary */
+    let _ = inc_counter_value(next_id_ref) in /* initialize to 0 */
     let _ = if trace() then print_debug(format(f'inferExpr ~p', {expression})) else {} in
     let {_, inf_expression, delta} = infer([], expression, next_id_ref) in
     let _ = if trace() then print_debug(format(f'∆ = ~p', {delta})) else {} in
     let ident = "my expression" in
     let _ = if trace() then print_debug(format(f'~s: ~p~n', {ident, inf_expression})) else {} in
+    /* apply the final context to the top-level term, which will have only been inferred and not */
+    /* checked (checking is where we normally apply contexts) */
     apply_expression(delta, inf_expression)
 end
 
