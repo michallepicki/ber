@@ -458,7 +458,7 @@ module Checker = struct
   /* Runs inference on `expr` and returns the term with type assigned or throws an error. */
   val infer_expression(expression) =
     let next_id_ref = init_next_id() in /* makes error messages less arbitrary */
-    let _ = inc_counter_value(next_id_ref) in /* initialize to 0 */
+    let _ = inc_counter_value(next_id_ref) in /* initialize to 1 */
     let _ = if trace() then print_debug(format(f'inferExpr ~p', {expression})) else {} in
     let {_, inf_expression, delta} = infer([], expression, next_id_ref) in
     let _ = if trace() then print_debug(format(f'∆ = ~p', {delta})) else {} in
