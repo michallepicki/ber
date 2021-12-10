@@ -1,6 +1,6 @@
 package: "ber"
 main_module: "Ber"
-language: "v0.1.5"
+language: "v0.2.0"
 source_directories:
   - "src"
 test_directories:
